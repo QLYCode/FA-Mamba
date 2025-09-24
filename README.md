@@ -3,7 +3,7 @@
 
 #### [📌] The paper is currently under review (not yet published), and the source code will be released only after official acceptance.
 
-This repository is the official implementation of the paper SPC-Seg
+This repository is the official implementation of the paper Frequency-Aware Mamba.
 ## Datasets
 
 ### DDTI
