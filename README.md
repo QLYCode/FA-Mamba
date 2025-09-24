@@ -41,8 +41,6 @@ Some important required packages include:
 
 To train the model, run this command:
 
-### train SparseMamba_PCL
-
 ```python train.py```
 
 
