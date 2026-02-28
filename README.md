@@ -1,7 +1,7 @@
 
 # Frequency-Aware Mamba: Exploiting Frequency-Domain Priors to Alleviate Class Imbalance in Medical Image Segmentation
 
-#### [📌] The paper is currently under review (not yet published), and the source code will be released only after official acceptance.
+#### [📌] The paper has not yet been published, and the source code will be released upon official publication.
 
 This repository is the official implementation of the paper Frequency-Aware Mamba.
 ## Datasets
