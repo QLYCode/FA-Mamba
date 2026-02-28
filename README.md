@@ -1,16 +1,18 @@
 
-# Frequency-Aware Mamba: Exploiting Frequency-Domain Priors to Alleviate Class Imbalance in Medical Image Segmentation
+# RSR-Mamba: Recurrent Self-Reasoning forUncertainty-Aware Ultrasound Segmentation
 
-#### [📌] The paper has not yet been published, and the source code will be released upon official publication.
+#### [📌] The paper is currently under review; the full source code will be released upon publication.
 
 This repository is the official implementation of the paper Frequency-Aware Mamba.
+
 ## Datasets
 
 ### DDTI
-For DDTI, which is challenging due to low contrast and ambiguous boundaries, we use five-fold cross-validation with mutually exclusive folds for training and validation. 
+(a) TG3K contains 3,585 thyroid ultrasound frames; we use 2,758 for training and 827 for testing.
 
-### TN3K
-For TN3K, which exhibits large nodule-scale variation and class imbalance: 2,303 images for training, 576 for validation, and 614 for testing. All experiments adopt 5-fold cross-validation. Performance is evaluated by Accuracy, Dice, IoU, FLOPs, and Params.
+
+### BUSI
+BUSI includes 780 breast ultrasound images, we focus on 647 benign and malignant cases and perform 5-fold cross-validation.
 
 
 ## Requirements
@@ -41,11 +43,7 @@ Some important required packages include:
 
 To train the model, run this command:
 
-```python train.py```
+```python run.py```
 
 
-## Evaluation
 
-To evaluate the model, run this command:
-
-``` python test.py ```
