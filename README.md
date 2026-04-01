@@ -1,9 +1,7 @@
 
 # Frequency-Aware Mamba: Exploiting Frequency-Domain Priors to Alleviate Class Imbalance in Medical Image Segmentation
 
-👉 Accepted at IEEE ICASSP 2026
-
-This repository is the official implementation of the paper Frequency-Aware Mamba.
+👉 Accepted at IEEE ICASSP 2026: This repository is the official implementation of the paper Frequency-Aware Mamba.
 
 ## Datasets
 
