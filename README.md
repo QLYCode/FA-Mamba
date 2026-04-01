@@ -1,7 +1,5 @@
 
-# RSR-Mamba: Recurrent Self-Reasoning forUncertainty-Aware Ultrasound Segmentation
-
-#### [📌] The paper is currently under review; the full source code will be released upon publication.
+# FREQUENCY-AWARE MAMBA: EXPLOITING FREQUENCY-DOMAIN PRIORS TO ALLEVIATE CLASS IMBALANCE IN MEDICAL IMAGE SEGMENTATION
 
 This repository is the official implementation of the paper Frequency-Aware Mamba.
 
@@ -43,7 +41,7 @@ Some important required packages include:
 
 To train the model, run this command:
 
-```python run.py```
+```python train.py```
 
 
 
