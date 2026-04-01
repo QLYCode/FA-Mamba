@@ -6,11 +6,12 @@
 ## Datasets
 
 ### DDTI
-(a) TG3K contains 3,585 thyroid ultrasound frames; we use 2,758 for training and 827 for testing.
+The DDTI dataset is characterized by low contrast and ambiguous boundaries, making it challenging for precise segmentation.  
+Following prior work, we adopt **five-fold cross-validation** for evaluation.
 
+### TN3K
+The TN3K dataset exhibits large-scale variation and class imbalance. We follow the official split in [1]: 2,303 training, 576 validation, and 614 testing images.
 
-### BUSI
-BUSI includes 780 breast ultrasound images, we focus on 647 benign and malignant cases and perform 5-fold cross-validation.
 
 
 ## Requirements
