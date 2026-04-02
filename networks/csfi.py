@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 
 # Setup device
-device_id = 3
+device_id = 0
 device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
 if device.type == "cuda":
     torch.cuda.set_device(device_id)
@@ -71,14 +71,14 @@ class MultiSpectralDCTLayer(nn.Module):
         self.channel = channel
         self.register_buffer(
             'weight',
-            self.get_dct_filter(height, width, mapper_x, mapper_y, channel),  # [C, H, W]
+            self.get_dct_filter(height, width, mapper_x, mapper_y, channel),
         )
 
     def forward(self, x):
         n, c, h, w = x.shape
         assert c == self.channel, f"Input C={c} != DCT C={self.channel}"
-        x = x * self.weight.unsqueeze(0).to(x.device)  # [N, C, H, W]
-        return torch.sum(x, dim=(2, 3))                 # [N, C]
+        x = x * self.weight.unsqueeze(0).to(x.device)
+        return torch.sum(x, dim=(2, 3))
 
     def build_filter(self, pos, freq, POS):
         val = math.cos(math.pi * freq * (pos + 0.5) / POS) / math.sqrt(POS)
@@ -97,14 +97,17 @@ class MultiSpectralDCTLayer(nn.Module):
 
 
 class FrequencyChannelAttention(nn.Module):
-    def __init__(self, channel_hint, dct_h, dct_w, reduction=16, freq_sel_method='top16'):
+    """
+    通道频率注意力。
+    返回 x * channel_attention，形状与输入相同，值域不限（attention 经 sigmoid 在 (0,1)）。
+    """
+    def __init__(self, channel, dct_h, dct_w, reduction=16, freq_sel_method='top16'):
         super().__init__()
         self.dct_h = dct_h
         self.dct_w = dct_w
         self.reduction = reduction
         self.freq_sel_method = freq_sel_method
-
-        self.channel = None
+        self._built_channel = None
         self.dct_layer = None
         self.fc = None
 
@@ -115,7 +118,7 @@ class FrequencyChannelAttention(nn.Module):
         return mapper_x, mapper_y
 
     def _build_if_needed(self, C):
-        if self.channel == C and self.dct_layer is not None and self.fc is not None:
+        if self._built_channel == C and self.dct_layer is not None and self.fc is not None:
             return
         mapper_x, mapper_y = self._get_mappers()
         self.dct_layer = MultiSpectralDCTLayer(
@@ -128,7 +131,7 @@ class FrequencyChannelAttention(nn.Module):
             nn.Linear(mid, C, bias=False),
             nn.Sigmoid(),
         )
-        self.channel = C
+        self._built_channel = C
 
     def forward(self, x):
         n, c, h, w = x.shape
@@ -145,16 +148,16 @@ class FrequencyChannelAttention(nn.Module):
             else F.adaptive_avg_pool2d(x, (self.dct_h, self.dct_w))
         )
         y = self.dct_layer(x_pooled)  # [N, C]
-        y = self.fc(y)                # [N, C]
+        y = self.fc(y)                # [N, C]，(0, 1)
         y = y.view(n, c, 1, 1)
-        return x * y
+        return x * y  + x                # x * channel_attention
 
 
 class MultiSpectralPatchDCT2D(nn.Module):
     """
     以 patch 为单位的 2D-DCT 投影层。
     输入:  x [B, C, H, W]
-    输出:  Freq_hw [B, M, H, W]  (M 为选择的频率基数量；采用最近邻回放到像素级)
+    输出:  Freq_hw [B, M, H, W]
     """
 
     def __init__(self, patch_h: int, patch_w: int, mapper_x, mapper_y):
@@ -172,7 +175,7 @@ class MultiSpectralPatchDCT2D(nn.Module):
             Bv = torch.cos(torch.pi * (torch.arange(self.pw) + 0.5) * v / self.pw) / math.sqrt(self.pw)
             if v != 0:
                 Bv = Bv * math.sqrt(2)
-            bases.append(torch.ger(Bu, Bv))  # [ph, pw]
+            bases.append(torch.ger(Bu, Bv))
         self.register_buffer('dct_bases', torch.stack(bases, dim=0))  # [M, ph, pw]
 
     @staticmethod
@@ -192,38 +195,31 @@ class MultiSpectralPatchDCT2D(nn.Module):
         return x[..., :-pad_h if pad_h else None, :-pad_w if pad_w else None]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, C, H, W] -> Freq_hw: [B, M, H, W]"""
         B, C, H, W = x.shape
         ph, pw = self.ph, self.pw
         M = self.num_freq
 
-        # 1) 通道均值，得到单通道空间信号
-        x_mean = x.mean(dim=1, keepdim=True)  # [B, 1, H, W]
-
-        # 2) pad 并 unfold 成 patch
+        x_mean = x.mean(dim=1, keepdim=True)
         x_mean, pad_hw = self._pad_to_multiple(x_mean, ph, pw)
         Hpad, Wpad = x_mean.shape[-2], x_mean.shape[-1]
         Hp, Wp = Hpad // ph, Wpad // pw
 
-        patches = F.unfold(x_mean, kernel_size=(ph, pw), stride=(ph, pw))  # [B, ph*pw, L]
+        patches = F.unfold(x_mean, kernel_size=(ph, pw), stride=(ph, pw))
 
-        # 3) 与每个 DCT 基做内积，得到频率系数
-        bases = self.dct_bases.to(dtype=patches.dtype, device=patches.device)  # [M, ph, pw]
-        bases_flat = bases.view(M, ph * pw)                                    # [M, ph*pw]
-        coeff = torch.einsum('b n l, m n -> b m l', patches, bases_flat)      # [B, M, L]
+        bases = self.dct_bases.to(dtype=patches.dtype, device=patches.device)
+        bases_flat = bases.view(M, ph * pw)
+        coeff = torch.einsum('b n l, m n -> b m l', patches, bases_flat)
 
-        # 4) 还原到 patch 网格，再最近邻插值回像素级
-        coeff_grid = coeff.view(B, M, Hp, Wp)                                 # [B, M, Hp, Wp]
-        freq_map = F.interpolate(coeff_grid, scale_factor=(ph, pw), mode='nearest')  # [B, M, Hpad, Wpad]
-        freq_map = self._crop(freq_map, pad_hw)                                # [B, M, H, W]
+        coeff_grid = coeff.view(B, M, Hp, Wp)
+        freq_map = F.interpolate(coeff_grid, scale_factor=(ph, pw), mode='nearest')
+        freq_map = self._crop(freq_map, pad_hw)
         return freq_map
 
 
 class FrequencySpatialAttention(nn.Module):
     """
-    Spatial Frequency Transform (SFT) 注意力：
-    将输入以 p×p patch 做 2D-DCT，选取指定频率系数形成 Freq_hw，
-    经 1×1 卷积映射回 C 通道后，sigmoid 得到空间门控并逐点调制原特征。
+    空间频率注意力。
+    返回 x * spatial_gate，形状与输入相同。
     """
 
     def __init__(self, channel=32, patch_h=8, patch_w=8, freq_sel_method='low8'):
@@ -239,23 +235,38 @@ class FrequencySpatialAttention(nn.Module):
         self.act = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """x: [B, C, H, W] -> [B, C, H, W]"""
-        freq_hw = self.dct_patch(x)        # [B, M, H, W]
-        gate = self.act(self.proj(freq_hw))  # [B, C, H, W]
-        return x * gate
+        freq_hw = self.dct_patch(x)
+        gate = self.act(self.proj(freq_hw))  # [B, C, H, W]，(0, 1)
+        return x * gate + x                     # x * spatial_gate
 
 
 class CSFI(nn.Module):
+    """
+    Channel-Spatial Frequency Injection。
+
+    forward 输出：
+        CFT(x) + SFT(x) + x
+      = x*attn_c + x*attn_s + x
+      = x * (attn_c + attn_s + 1)
+
+    等价于对 x 做频率感知的残差缩放，attn 均在 (0,1)，
+    整体增益在 (1, 3) 之间，数值稳定，梯度畅通。
+
+    调用方 BasicResBlock.forward 应写：
+        y = self.csfi(y)        # csfi 内部已含残差
+    而非：
+        y = self.csfi(y) + x    # 错误：会重复加残差
+    """
 
     def __init__(self, channels, dct_h=7, dct_w=7, reduction=16, freq_sel_method='top16'):
         super(CSFI, self).__init__()
         self.fca = FrequencyChannelAttention(
-            channel_hint=channels,
+            channel=channels,
             dct_h=dct_h,
             dct_w=dct_w,
             reduction=reduction,
             freq_sel_method=freq_sel_method,
-        ).to(device)
+        )
         self.fsa = FrequencySpatialAttention(
             channel=channels,
             patch_h=8,
@@ -264,5 +275,4 @@ class CSFI(nn.Module):
         )
 
     def forward(self, x):
-        output = x * self.fca(x) + x * self.fsa(x)
-        return output
+        return self.fca(x) + self.fsa(x)
