@@ -99,7 +99,9 @@ class MultiSpectralDCTLayer(nn.Module):
 class FrequencyChannelAttention(nn.Module):
     """
     通道频率注意力。
-    返回 x * channel_attention，形状与输入相同，值域不限（attention 经 sigmoid 在 (0,1)）。
+    Fix: 在 __init__ 中立即构建 dct_layer 和 fc，确保它们被注册为正式子模块，
+    state_dict 保存/加载和多卡训练都不会出现权重重置问题。
+    返回 x * channel_attention。
     """
     def __init__(self, channel, dct_h, dct_w, reduction=16, freq_sel_method='top16'):
         super().__init__()
@@ -107,42 +109,24 @@ class FrequencyChannelAttention(nn.Module):
         self.dct_w = dct_w
         self.reduction = reduction
         self.freq_sel_method = freq_sel_method
-        self._built_channel = None
-        self.dct_layer = None
-        self.fc = None
 
-    def _get_mappers(self):
-        mapper_x, mapper_y = get_freq_indices(self.freq_sel_method)
-        mapper_x = [ux * (self.dct_h // 7) for ux in mapper_x]
-        mapper_y = [vy * (self.dct_w // 7) for vy in mapper_y]
-        return mapper_x, mapper_y
+        # 立即构建，不延迟——保证子模块在 state_dict 中
+        mapper_x, mapper_y = get_freq_indices(freq_sel_method)
+        mapper_x = [ux * (dct_h // 7) for ux in mapper_x]
+        mapper_y = [vy * (dct_w // 7) for vy in mapper_y]
 
-    def _build_if_needed(self, C):
-        if self._built_channel == C and self.dct_layer is not None and self.fc is not None:
-            return
-        mapper_x, mapper_y = self._get_mappers()
-        self.dct_layer = MultiSpectralDCTLayer(
-            self.dct_h, self.dct_w, mapper_x, mapper_y, C
-        )
-        mid = max(1, C // self.reduction)
+        self.dct_layer = MultiSpectralDCTLayer(dct_h, dct_w, mapper_x, mapper_y, channel)
+
+        mid = max(1, channel // reduction)
         self.fc = nn.Sequential(
-            nn.Linear(C, mid, bias=False),
+            nn.Linear(channel, mid, bias=False),
             nn.ReLU(inplace=True),
-            nn.Linear(mid, C, bias=False),
+            nn.Linear(mid, channel, bias=False),
             nn.Sigmoid(),
         )
-        self._built_channel = C
 
     def forward(self, x):
         n, c, h, w = x.shape
-        self._build_if_needed(c)
-        x_device = x.device
-
-        if next(self.fc.parameters()).device != x_device:
-            self.fc.to(x_device)
-        if any(p.device != x_device for p in self.dct_layer.parameters()):
-            self.dct_layer.to(x_device)
-
         x_pooled = (
             x if (h == self.dct_h and w == self.dct_w)
             else F.adaptive_avg_pool2d(x, (self.dct_h, self.dct_w))
@@ -150,7 +134,7 @@ class FrequencyChannelAttention(nn.Module):
         y = self.dct_layer(x_pooled)  # [N, C]
         y = self.fc(y)                # [N, C]，(0, 1)
         y = y.view(n, c, 1, 1)
-        return x * y  + x                # x * channel_attention
+        return x * y
 
 
 class MultiSpectralPatchDCT2D(nn.Module):
@@ -218,8 +202,7 @@ class MultiSpectralPatchDCT2D(nn.Module):
 
 class FrequencySpatialAttention(nn.Module):
     """
-    空间频率注意力。
-    返回 x * spatial_gate，形状与输入相同。
+    空间频率注意力。返回 x * spatial_gate。
     """
 
     def __init__(self, channel=32, patch_h=8, patch_w=8, freq_sel_method='low8'):
@@ -237,25 +220,22 @@ class FrequencySpatialAttention(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         freq_hw = self.dct_patch(x)
         gate = self.act(self.proj(freq_hw))  # [B, C, H, W]，(0, 1)
-        return x * gate + x                     # x * spatial_gate
+        return x * gate
 
 
 class CSFI(nn.Module):
     """
     Channel-Spatial Frequency Injection。
 
-    forward 输出：
-        CFT(x) + SFT(x) + x
-      = x*attn_c + x*attn_s + x
-      = x * (attn_c + attn_s + 1)
+    output = fca(x) + fsa(x) + x
+           = x*attn_c + x*attn_s + x
+           = x * (attn_c + attn_s + 1)
 
-    等价于对 x 做频率感知的残差缩放，attn 均在 (0,1)，
-    整体增益在 (1, 3) 之间，数值稳定，梯度畅通。
+    attn_c, attn_s ∈ (0,1)，整体增益在 (1,3)，数值稳定。
 
-    调用方 BasicResBlock.forward 应写：
-        y = self.csfi(y)        # csfi 内部已含残差
-    而非：
-        y = self.csfi(y) + x    # 错误：会重复加残差
+    调用方 BasicResBlock.forward 中：
+        y = self.csfi(y)     ← 正确，csfi 内部已含残差
+        y = self.csfi(y) + x ← 错误，会重复加残差
     """
 
     def __init__(self, channels, dct_h=7, dct_w=7, reduction=16, freq_sel_method='top16'):
@@ -275,4 +255,4 @@ class CSFI(nn.Module):
         )
 
     def forward(self, x):
-        return self.fca(x) + self.fsa(x)
+        return self.fca(x) + self.fsa(x) + x
