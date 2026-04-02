@@ -6,8 +6,7 @@
 ## Datasets
 
 ### DDTI
-The DDTI dataset is characterized by low contrast and ambiguous boundaries, making it challenging for precise segmentation.  
-Following prior work, we adopt **five-fold cross-validation** for evaluation.
+The DDTI dataset is characterized by low contrast and ambiguous boundaries, making it challenging for precise segmentation. Following prior work, we adopt **five-fold cross-validation** for evaluation.
 
 ### TN3K
 The TN3K dataset exhibits large-scale variation and class imbalance. We follow the official split in [1]: 2,303 training, 576 validation, and 614 testing images.
