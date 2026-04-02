@@ -126,7 +126,7 @@ class FrequencyChannelAttention(nn.Module):
         y = self.fc(y)  # -> x_device
         y = y.view(n, c, 1, 1)
 
-        return x * y
+        return y
 
 
 # -------------------------------------------------------------------------
@@ -328,7 +328,7 @@ class FrequencySpatialAttention(nn.Module):
         # ③④ 可学习缩放 + sigmoid → 空间门控
         gate = self.act(self.proj(freq_hw))  # [B, 1, H, W]
 
-        return x * gate                      # 广播到 [B, C, H, W]
+        return gate                      # 广播到 [B, C, H, W]
 
 
 class CSFI(nn.Module):
@@ -350,6 +350,7 @@ class CSFI(nn.Module):
         )
 
     def forward(self, x):
-        # 论文 Eq.(9): FT(x) = CFT(x) + SFT(x)
-        output =  self.fca(x) + self.fsa(x)
+
+        output =  x *  self.fca(x) + x *  self.fsa(x)
+
         return output

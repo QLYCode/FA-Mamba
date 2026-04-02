@@ -90,64 +90,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-
-# ---------------------------------------------------------------------------
-# Fix: FrequencySelectivePruner2D — 按论文 Eq.(10-12) 重写
-#
-# 论文流程：
-#   1. 将 FT(x) [B,C,H,W] 按 p×p 分成不重叠 patch D_uv ∈ R^{C×p×p}
-#   2. 对每个 patch 的每个通道做 2D DCT，得到 D_uv^(c)(i,j)
-#   3. 频域能量（Eq.10）：
-#        Freq_local(u,v) = Σ_{i,j,c} |D_uv^(c)(i,j)|，排除 DC 项 (i=0,j=0)
-#   4. 可学习阈值 τ，硬掩码（Eq.11）：M_uv = I(Freq_local > τ)
-#      训练时用 sigmoid STE 使梯度可流；推理时用硬掩码
-#   5. 逐 patch 乘掩码后重组（Eq.12）：X̃ = Assemble(D_uv · M_uv)
-#      pruned 区域补零，保持空间布局不变
-#
-# 原代码问题：
-#   1. 能量在空间域计算（x.abs().mean(dim=1)），未做 DCT       ← 改
-#   2. 未排除 DC 项 (i=0,j=0)                                ← 改
-#   3. FrequencySelectivePruner2D 从未在 ES2D.__init__ 中实例化 ← 改（见 ES2D）
-# ---------------------------------------------------------------------------
-
 class FrequencySelectivePruner2D(nn.Module):
     """
-    Frequency-Selective Pruning（论文 Eq.10-12）:
-      - 对每个 p×p patch 的每个通道做 2D DCT
-      - 频域能量 = Σ_{i,j,c} |DCT系数(i,j,c)|，排除 DC 项 (i=0,j=0)
-      - 可学习阈值 τ，STE 硬掩码
-      - 低能量 patch 置零后重组
+    Frequency-Selective Pruning:
+    - 将 x 按 p×p 不重叠 patch 切分
+    - 计算每个 patch 的 L1 频域能量（可选轻量高通增强）
+    - 基于可学习阈值 tau 构造“硬掩码”（用 STE 让其可训练）
+    - 将低能量 patch 置零后折回，保持原 H×W 的空间布局
     """
-    def __init__(self,
-                 patch_size: int = 8,
-                 tau_init: float = 0.0,
-                 ste_alpha: float = 8.0):
+    def __init__(self, patch_size: int = 8, tau_init: float = 0.0, ste_alpha: float = 8.0, use_highpass: bool = False):
         super().__init__()
         self.p = int(patch_size)
         self.tau = nn.Parameter(torch.tensor(float(tau_init)))
         self.alpha = float(ste_alpha)
-
-        # 预计算正交 DCT-II 基矩阵 [p, p]，供 2D DCT 使用
-        p = self.p
-        mat = self._dct1d_matrix(p)           # [p, p]
-        # 2D DCT 矩阵 = kron(mat_row, mat_col)，[p*p, p*p]
-        dct2d = torch.kron(mat, mat)
-        self.register_buffer('dct2d', dct2d)  # 随 .to(device) 自动迁移
-
-        # DC 项在展平后的索引为 0（对应 (i=0,j=0)），构造非 DC 掩码
-        non_dc_mask = torch.ones(p * p, dtype=torch.bool)
-        non_dc_mask[0] = False                # 排除 DC
-        self.register_buffer('non_dc_mask', non_dc_mask)
-
-    @staticmethod
-    def _dct1d_matrix(N: int) -> torch.Tensor:
-        """正交 DCT-II 基矩阵 [N, N]"""
-        k = torch.arange(N).float()
-        n = torch.arange(N).float()
-        mat = torch.cos(math.pi / N * (n.unsqueeze(0) + 0.5) * k.unsqueeze(1))  # [N, N]
-        mat[0] /= math.sqrt(N)
-        mat[1:] /= math.sqrt(N / 2)
-        return mat
+        self.use_highpass = bool(use_highpass)
 
     @staticmethod
     def _pad_to_multiple(x: torch.Tensor, p: int):
@@ -167,57 +123,38 @@ class FrequencySelectivePruner2D(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        x: [B, C, H, W]  ← 论文中的 FT(x)，即 CSFI 的输出
-        返回 X̃: [B, C, H, W]，低频域能量 patch 已置零
+        x: [B, C, H, W] -> x_pruned: [B, C, H, W]
+        论文对应：
+          Freq_local(u,v) = sum |P_uv(i,j)|
+          M_uv = I(Freq_local > tau)    （hard mask with STE）
+          \tilde{X} = Assemble(P_uv * M_uv)
         """
         B, C, H, W = x.shape
         p = self.p
 
-        # ---------- 1. pad & unfold ----------
-        x_pad, pad_hw = self._pad_to_multiple(x, p)
-        Hpad, Wpad = x_pad.shape[-2], x_pad.shape[-1]
+        # FT(x)：可选轻量高通；否则直接用 x（与你的 “Given FT(x)” 对齐）
+        x_ft = x - F.avg_pool2d(x, kernel_size=3, stride=1, padding=1) if self.use_highpass else x
 
-        # unfold: [B, C*p*p, L]，L = (Hpad/p)*(Wpad/p)
-        x_unf = F.unfold(x_pad, kernel_size=p, stride=p)
-        L = x_unf.shape[-1]
+        # 频域能量：|·| 的通道均值 -> unfold 成 p×p patch -> 对每个 patch 求 L1 和
+        mag = x_ft.abs().mean(dim=1, keepdim=True)                # [B,1,H,W]
+        mag, pad_hw = self._pad_to_multiple(mag, p)
+        x_pad, _ = self._pad_to_multiple(x, p)
 
-        # ---------- 2. 对每个 patch 每个通道做 2D DCT ----------
-        # reshape: [B, C, p*p, L]
-        x_patches = x_unf.view(B, C, p * p, L)
+        patches_mag = F.unfold(mag, kernel_size=p, stride=p)      # [B, p*p, L], L=Hp*Wp
+        energy = patches_mag.sum(dim=1)                            # [B, L] = Freq_local(u,v)
 
-        dct2d = self.dct2d.to(dtype=x_patches.dtype)  # [p*p, p*p]
-        # einsum: (B, C, p*p, L) x (p*p, p*p) -> (B, C, p*p, L)
-        # 即对每个 (b, c, l) 的长度 p*p 向量左乘 DCT 矩阵
-        dct_patches = torch.einsum('b c n l, m n -> b c m l', x_patches, dct2d)
-        # dct_patches: [B, C, p*p, L]，其中 dct_patches[:,:,0,:] 为 DC 项
+        # 硬掩码 + STE
+        tau = self.tau.view(1, 1).to(energy.dtype).to(energy.device)
+        mask_soft = torch.sigmoid(self.alpha * (energy - tau))     # [B, L]
+        mask_hard = (energy > tau).to(energy.dtype)
+        mask = mask_hard.detach() - mask_soft.detach() + mask_soft # STE：前向硬、反向软
 
-        # ---------- 3. 频域能量（排除 DC 项，Eq.10）----------
-        # non_dc_mask: [p*p]，DC 位置为 False
-        non_dc = self.non_dc_mask.to(dct_patches.device)       # [p*p]
-        # 只取非 DC 系数
-        dct_non_dc = dct_patches[:, :, non_dc, :]              # [B, C, p*p-1, L]
-        # Σ_{i,j,c} |D_uv^(c)(i,j)| over all channels and non-DC freqs -> [B, L]
-        energy = dct_non_dc.abs().sum(dim=(1, 2))              # [B, L]
-
-        # ---------- 4. 可学习阈值 τ + STE 硬掩码（Eq.11）----------
-        tau = self.tau.to(dtype=energy.dtype)
-        mask_soft = torch.sigmoid(self.alpha * (energy - tau)) # [B, L]，训练时可微
-        mask_hard = (energy > tau).to(energy.dtype)            # [B, L]，前向硬掩码
-        # STE：前向用 hard，反向梯度经过 soft
-        mask = mask_hard.detach() - mask_soft.detach() + mask_soft  # [B, L]
-
-        # ---------- 5. 逐 patch 置零后重组（Eq.12）----------
-        # mask 广播到 [B, C*p*p, L]
-        x_unf_pruned = x_unf * mask.unsqueeze(1)              # [B, C*p*p, L]
-        x_pruned_pad = F.fold(
-            x_unf_pruned,
-            output_size=(Hpad, Wpad),
-            kernel_size=p,
-            stride=p
-        )                                                       # [B, C, Hpad, Wpad]
-        x_pruned = self._crop(x_pruned_pad, pad_hw)           # [B, C, H, W]
+        # 将掩码施加在原特征的 patch 上，再 fold 回原空间
+        x_unf = F.unfold(x_pad, kernel_size=p, stride=p)          # [B, C*p*p, L]
+        x_unf = x_unf * mask.unsqueeze(1)                         # 广播到每个 patch 的 C*p*p 元素
+        x_pruned = F.fold(x_unf, output_size=x_pad.shape[-2:], kernel_size=p, stride=p)
+        x_pruned = self._crop(x_pruned, pad_hw)                   # [B, C, H, W]
         return x_pruned
-
 
 class EfficientScan(torch.autograd.Function):
     # [B, C, H, W] -> [B, 4, C, H * W] (original)
@@ -432,37 +369,27 @@ class ES2D(nn.Module):
             forward_type="v2",
             # ======================
             step_size=2,
-            # --------- frequency-selective pruning ---------
+            # --------- NEW: frequency-selective pruning ---------
             enable_prune=True,
             prune_patch=8,
             prune_tau_init=0.0,
             prune_ste_alpha=8.0,
-            # Fix: 删去 prune_highpass 参数（论文无此设计）
-            # -----------------------------------------------
+            prune_highpass=False,
+            # ----------------------------------------------------
             **kwargs,
     ):
+        """
+        ssm_rank_ratio would be used in the future...
+        """
         factory_kwargs = {"device": None, "dtype": None}
         super().__init__()
         d_expand = int(ssm_ratio * d_model)
         d_inner = int(min(ssm_rank_ratio, ssm_ratio) * d_model) if ssm_rank_ratio > 0 else d_expand
         self.dt_rank = math.ceil(d_model / 16) if dt_rank == "auto" else dt_rank
-        self.d_state = math.ceil(d_model / 6) if d_state == "auto" else d_state
+        self.d_state = math.ceil(d_model / 6) if d_state == "auto" else d_state  # 20240109
         self.d_conv = d_conv
-        self.step_size = step_size
 
-        # -------------------------------------------------------
-        # Fix: 在 __init__ 中真正实例化 FrequencySelectivePruner2D
-        # 原代码：只保存了参数，从未执行 self.pruner = FrequencySelectivePruner2D(...)
-        # 导致 forward_corev2 里 self.pruner(x) 必然 AttributeError
-        # -------------------------------------------------------
-        self.enable_prune = enable_prune
-        if self.enable_prune:
-            self.pruner = FrequencySelectivePruner2D(
-                patch_size=prune_patch,
-                tau_init=prune_tau_init,
-                ste_alpha=prune_ste_alpha,
-                # Fix: 移除 use_highpass 参数，论文中能量基于 DCT 系数域，无空间高通预处理
-            )
+        self.step_size = step_size
 
         # disable z act ======================================
         self.disable_z_act = forward_type[-len("nozact"):] == "nozact"
@@ -536,12 +463,14 @@ class ES2D(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0. else nn.Identity()
 
         if simple_init:
+            # simple init dt_projs, A_logs, Ds
             self.Ds = nn.Parameter(torch.ones((self.K2 * d_inner)))
             self.A_logs = nn.Parameter(
-                torch.randn((self.K2 * d_inner, self.d_state)))
+                torch.randn((self.K2 * d_inner, self.d_state)))  # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
             self.dt_projs_weight = nn.Parameter(torch.randn((self.K, d_inner, self.dt_rank)))
             self.dt_projs_bias = nn.Parameter(torch.randn((self.K, d_inner)))
 
+        # dt proj ============================
         self.dt_projs = [
             self.dt_init(self.dt_rank, d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor, **factory_kwargs)
             for _ in range(self.K)
@@ -551,6 +480,8 @@ class ES2D(nn.Module):
     def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
                 **factory_kwargs):
         dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
+
+        # Initialize special dt projection to preserve variance at initialization
         dt_init_std = dt_rank ** -0.5 * dt_scale
         if dt_init == "constant":
             nn.init.constant_(dt_proj.weight, dt_init_std)
@@ -558,23 +489,28 @@ class ES2D(nn.Module):
             nn.init.uniform_(dt_proj.weight, -dt_init_std, dt_init_std)
         else:
             raise NotImplementedError
+
+        # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
         dt = torch.exp(
             torch.rand(d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
             + math.log(dt_min)
         ).clamp(min=dt_init_floor)
+        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         with torch.no_grad():
             dt_proj.bias.copy_(inv_dt)
+
         return dt_proj
 
     @staticmethod
     def A_log_init(d_state, d_inner, copies=-1, device=None, merge=True):
+        # S4D real initialization
         A = repeat(
             torch.arange(1, d_state + 1, dtype=torch.float32, device=device),
             "n -> d n",
             d=d_inner,
         ).contiguous()
-        A_log = torch.log(A)
+        A_log = torch.log(A)  # Keep A_log in fp32
         if copies > 0:
             A_log = repeat(A_log, "d n -> r d n", r=copies)
             if merge:
@@ -585,12 +521,13 @@ class ES2D(nn.Module):
 
     @staticmethod
     def D_init(d_inner, copies=-1, device=None, merge=True):
+        # D "skip" parameter
         D = torch.ones(d_inner, device=device)
         if copies > 0:
             D = repeat(D, "n1 -> r n1", r=copies)
             if merge:
                 D = D.flatten(0, 1)
-        D = nn.Parameter(D)
+        D = nn.Parameter(D)  # Keep in fp32
         D._no_weight_decay = True
         return D
 
@@ -601,9 +538,8 @@ class ES2D(nn.Module):
         if self.ssm_low_rank:
             x = self.in_rank(x)
 
-        # Fix: 使用已正确实例化的 self.pruner（原代码此处 self.pruner 未实例化，必然报错）
-        # 论文 Eq.(10-12)：pruning 在 cross-scan 之前对 FT(x) 执行
-        if self.enable_prune:
+        # 若你集成了频域剪枝 pruner，这里保留；没有就删掉这一行
+        if hasattr(self, "enable_prune") and self.enable_prune:
             x = self.pruner(x)
 
         x = cross_selective_scan(
@@ -635,6 +571,218 @@ class ES2D(nn.Module):
         out = self.dropout(self.out_proj(y))
         return out
 
+##############old##################
+# class ES2D(nn.Module):
+#     def __init__(
+#             self,
+#             # basic dims ===========
+#             d_model=1024,
+#             d_state=16,
+#             ssm_ratio=2.0,
+#             ssm_rank_ratio=2.0,
+#             dt_rank="auto",
+#             act_layer=nn.SiLU,
+#             # dwconv ===============
+#             d_conv=3,  # < 2 means no conv
+#             conv_bias=True,
+#             # ======================
+#             dropout=0.0,
+#             bias=False,
+#             # dt init ==============
+#             dt_min=0.001,
+#             dt_max=0.1,
+#             dt_init="random",
+#             dt_scale=1.0,
+#             dt_init_floor=1e-4,
+#             simple_init=False,
+#             # ======================
+#             forward_type="v2",
+#             # ======================
+#             step_size=2,
+#             **kwargs,
+#     ):
+#         """
+#         ssm_rank_ratio would be used in the future...
+#         """
+#         factory_kwargs = {"device": None, "dtype": None}
+#         super().__init__()
+#         d_expand = int(ssm_ratio * d_model)
+#         d_inner = int(min(ssm_rank_ratio, ssm_ratio) * d_model) if ssm_rank_ratio > 0 else d_expand
+#         self.dt_rank = math.ceil(d_model / 16) if dt_rank == "auto" else dt_rank
+#         self.d_state = math.ceil(d_model / 6) if d_state == "auto" else d_state  # 20240109
+#         self.d_conv = d_conv
+#
+#         self.step_size = step_size
+#
+#         # disable z act ======================================
+#         self.disable_z_act = forward_type[-len("nozact"):] == "nozact"
+#         if self.disable_z_act:
+#             forward_type = forward_type[:-len("nozact")]
+#
+#         # softmax | sigmoid | norm ===========================
+#         if forward_type[-len("softmax"):] == "softmax":
+#             forward_type = forward_type[:-len("softmax")]
+#             self.out_norm = nn.Softmax(dim=1)
+#         elif forward_type[-len("sigmoid"):] == "sigmoid":
+#             forward_type = forward_type[:-len("sigmoid")]
+#             self.out_norm = nn.Sigmoid()
+#         else:
+#             self.out_norm = nn.LayerNorm(d_inner)
+#
+#         # forward_type =======================================
+#         self.forward_core = dict(
+#             v1=self.forward_corev2,
+#             v2=self.forward_corev2,
+#         ).get(forward_type, self.forward_corev2)
+#         self.K = 4 if forward_type not in ["share_ssm"] else 1
+#         self.K2 = self.K if forward_type not in ["share_a"] else 1
+#
+#         # in proj =======================================
+#         self.in_proj = nn.Linear(d_model, d_expand * 2, bias=bias, **factory_kwargs)
+#         self.act: nn.Module = act_layer()
+#
+#         # conv =======================================
+#         if self.d_conv > 1:
+#             self.conv2d = nn.Conv2d(
+#                 in_channels=d_expand,
+#                 out_channels=d_expand,
+#                 groups=d_expand,
+#                 bias=conv_bias,
+#                 kernel_size=d_conv,
+#                 padding=(d_conv - 1) // 2,
+#                 **factory_kwargs,
+#             )
+#
+#         # rank ratio =====================================
+#         self.ssm_low_rank = False
+#         if d_inner < d_expand:
+#             self.ssm_low_rank = True
+#             self.in_rank = nn.Conv2d(d_expand, d_inner, kernel_size=1, bias=False, **factory_kwargs)
+#             self.out_rank = nn.Linear(d_inner, d_expand, bias=False, **factory_kwargs)
+#
+#         # x proj ============================
+#         self.x_proj = [
+#             nn.Linear(d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs)
+#             for _ in range(self.K)
+#         ]
+#         self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))  # (K, N, inner)
+#         del self.x_proj
+#
+#         # dt proj ============================
+#         self.dt_projs = [
+#             self.dt_init(self.dt_rank, d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor, **factory_kwargs)
+#             for _ in range(self.K)
+#         ]
+#         self.dt_projs_weight = nn.Parameter(torch.stack([t.weight for t in self.dt_projs], dim=0))  # (K, inner, rank)
+#         self.dt_projs_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_projs], dim=0))  # (K, inner)
+#         del self.dt_projs
+#
+#         # A, D =======================================
+#         self.A_logs = self.A_log_init(self.d_state, d_inner, copies=self.K2, merge=True)  # (K * D, N)
+#         self.Ds = self.D_init(d_inner, copies=self.K2, merge=True)  # (K * D)
+#
+#         # out proj =======================================
+#         self.out_proj = nn.Linear(d_expand, d_model, bias=bias, **factory_kwargs)
+#         self.dropout = nn.Dropout(dropout) if dropout > 0. else nn.Identity()
+#
+#         if simple_init:
+#             # simple init dt_projs, A_logs, Ds
+#             self.Ds = nn.Parameter(torch.ones((self.K2 * d_inner)))
+#             self.A_logs = nn.Parameter(
+#                 torch.randn((self.K2 * d_inner, self.d_state)))  # A == -A_logs.exp() < 0; # 0 < exp(A * dt) < 1
+#             self.dt_projs_weight = nn.Parameter(torch.randn((self.K, d_inner, self.dt_rank)))
+#             self.dt_projs_bias = nn.Parameter(torch.randn((self.K, d_inner)))
+#
+#     @staticmethod
+#     def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
+#                 **factory_kwargs):
+#         dt_proj = nn.Linear(dt_rank, d_inner, bias=True, **factory_kwargs)
+#
+#         # Initialize special dt projection to preserve variance at initialization
+#         dt_init_std = dt_rank ** -0.5 * dt_scale
+#         if dt_init == "constant":
+#             nn.init.constant_(dt_proj.weight, dt_init_std)
+#         elif dt_init == "random":
+#             nn.init.uniform_(dt_proj.weight, -dt_init_std, dt_init_std)
+#         else:
+#             raise NotImplementedError
+#
+#         # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+#         dt = torch.exp(
+#             torch.rand(d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+#             + math.log(dt_min)
+#         ).clamp(min=dt_init_floor)
+#         # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+#         inv_dt = dt + torch.log(-torch.expm1(-dt))
+#         with torch.no_grad():
+#             dt_proj.bias.copy_(inv_dt)
+#
+#         return dt_proj
+#
+#     @staticmethod
+#     def A_log_init(d_state, d_inner, copies=-1, device=None, merge=True):
+#         # S4D real initialization
+#         A = repeat(
+#             torch.arange(1, d_state + 1, dtype=torch.float32, device=device),
+#             "n -> d n",
+#             d=d_inner,
+#         ).contiguous()
+#         A_log = torch.log(A)  # Keep A_log in fp32
+#         if copies > 0:
+#             A_log = repeat(A_log, "d n -> r d n", r=copies)
+#             if merge:
+#                 A_log = A_log.flatten(0, 1)
+#         A_log = nn.Parameter(A_log)
+#         A_log._no_weight_decay = True
+#         return A_log
+#
+#     @staticmethod
+#     def D_init(d_inner, copies=-1, device=None, merge=True):
+#         # D "skip" parameter
+#         D = torch.ones(d_inner, device=device)
+#         if copies > 0:
+#             D = repeat(D, "n1 -> r n1", r=copies)
+#             if merge:
+#                 D = D.flatten(0, 1)
+#         D = nn.Parameter(D)  # Keep in fp32
+#         D._no_weight_decay = True
+#         return D
+#
+#     def forward_corev2(self, x: torch.Tensor, nrows=-1, channel_first=False, step_size=2):
+#         nrows = 1
+#         if not channel_first:
+#             x = x.permute(0, 3, 1, 2).contiguous()
+#         if self.ssm_low_rank:
+#             x = self.in_rank(x)
+#         x = cross_selective_scan(
+#             x, self.x_proj_weight, None, self.dt_projs_weight, self.dt_projs_bias,
+#             self.A_logs, self.Ds, getattr(self, "out_norm", None),
+#             nrows=nrows, delta_softplus=True, step_size=step_size
+#         )
+#         if self.ssm_low_rank:
+#             x = self.out_rank(x)
+#         return x
+#
+#     def forward(self, x: torch.Tensor, **kwargs):
+#         xz = self.in_proj(x)
+#         if self.d_conv > 1:
+#             x, z = xz.chunk(2, dim=-1)  # (b, h, w, d)
+#             if not self.disable_z_act:
+#                 z = self.act(z)
+#             x = x.permute(0, 3, 1, 2).contiguous()
+#             x = self.act(self.conv2d(x))  # (b, d, h, w)
+#         else:
+#             if self.disable_z_act:
+#                 x, z = xz.chunk(2, dim=-1)  # (b, h, w, d)
+#                 x = self.act(x)
+#             else:
+#                 xz = self.act(xz)
+#                 x, z = xz.chunk(2, dim=-1)  # (b, h, w, d)
+#         y = self.forward_core(x, channel_first=(self.d_conv > 1), step_size=self.step_size)
+#         y = y * z
+#         out = self.dropout(self.out_proj(y))
+#         return out
+
 
 class ES2D_model(nn.Module):
     def __init__(self, input_dim):
@@ -661,6 +809,7 @@ class CustomNetwork(nn.Module):
 
     def forward(self, x):
         # 输入张量形状为 (batch, 1024, 256)
+        # 首先通过线性层
         x = self.linear1(x)
 
         # 分支1
@@ -678,7 +827,9 @@ class CustomNetwork(nn.Module):
         # 两个分支相乘
         x = branch1 * branch2
 
+        # 通过输出的线性层
         x = self.linear3(x)
+
         return x
 
 
@@ -707,6 +858,12 @@ class MambaLayer(nn.Module):
         super().__init__()
         self.dim = dim
         self.norm = nn.LayerNorm(dim)
+        # self.mamba = Mamba(
+        #         d_model=dim, # Model dimension d_model
+        #         d_state=d_state,  # SSM state expansion factor
+        #         d_conv=d_conv,    # Local convolution width
+        #         expand=expand,    # Block expansion factor
+        # )
         self.mamba_es2d = CustomNetwork()
 
     @autocast(enabled=False)
@@ -719,8 +876,12 @@ class MambaLayer(nn.Module):
         img_dims = x.shape[2:]
         x_flat = x.reshape(B, C, n_tokens).transpose(-1, -2)
         x_norm = self.norm(x_flat)  # (B, 1024, 256)
+
+        # x_mamba = self.mamba(x_norm) (B, 1024, 256)
         x_mamba = self.mamba_es2d(x_norm)  # (B, 1024, 256)
+
         out = x_mamba.transpose(-1, -2).reshape(B, C, *img_dims)
+
         return out
 
 
@@ -748,13 +909,13 @@ class BasicResBlock(nn.Module):
         self.conv2 = conv_op(output_channels, output_channels, kernel_size, padding=padding)
         self.norm2 = norm_op(output_channels, **norm_op_kwargs)
         self.act2 = nonlin(**nonlin_kwargs)
-        # Fix: CSFI 接收的 channels 应与 forward 中 y 的实际通道数一致，即 output_channels，
-        # 原代码写 output_channels*4 导致 compress 卷积权重形状与输入通道不匹配。
-        # dct_h/dct_w 对应当前 feature map 的空间分辨率，用 c2wh 映射；
-        # 若当前 output_channels 不在 c2wh 中，则退回默认值 7。
         dct_size = c2wh.get(output_channels, 7)
-        self.csfi = CSFI(channels=output_channels, dct_h=dct_size, dct_w=dct_size, reduction=16, freq_sel_method='top16')
+        self.csfi = CSFI(channels=output_channels, dct_h=dct_size, dct_w=dct_size, reduction=16,
+                         freq_sel_method='top16')
 
+        # self.csfi = CSFI(channels=output_channels*4, dct_h=c2wh[output_channels], dct_w=c2wh[output_channels], reduction=16, freq_sel_method='top16')
+        # self.csfi = CSFI(channels=output_channels, reduction=16) dct_h=7, dct_w=7,
+        # MultiSpectralAttentionLayer(planes * 4, c2wh[planes], c2wh[planes],  reduction=reduction, freq_sel_method = 'top16')
         if use_1x1conv:
             self.conv3 = conv_op(input_channels, output_channels, kernel_size=1, stride=stride)
         else:
@@ -799,10 +960,14 @@ class UNetResEncoder(nn.Module):
         if isinstance(strides, int):
             strides = [strides] * n_stages
 
-        assert len(kernel_sizes) == n_stages
-        assert len(n_blocks_per_stage) == n_stages
-        assert len(features_per_stage) == n_stages
-        assert len(strides) == n_stages
+        assert len(
+            kernel_sizes) == n_stages, "kernel_sizes must have as many entries as we have resolution stages (n_stages)"
+        assert len(
+            n_blocks_per_stage) == n_stages, "n_conv_per_stage must have as many entries as we have resolution stages (n_stages)"
+        assert len(
+            features_per_stage) == n_stages, "features_per_stage must have as many entries as we have resolution stages (n_stages)"
+        assert len(strides) == n_stages, "strides must have as many entries as we have resolution stages (n_stages). " \
+                                         "Important: first entry is recommended to be 1, else we run strided conv drectly on the input"
 
         pool_op = get_matching_pool_op(conv_op, pool_type=pool_type) if pool_type != 'conv' else None
 
@@ -844,6 +1009,7 @@ class UNetResEncoder(nn.Module):
 
         input_channels = stem_channels
 
+        # now build the network
         stages = []
         for s in range(n_stages):
             stage = nn.Sequential(
@@ -883,11 +1049,14 @@ class UNetResEncoder(nn.Module):
         self.output_channels = features_per_stage
         self.strides = [maybe_convert_scalar_to_list(conv_op, i) for i in strides]
         self.return_skips = return_skips
+
         self.conv_op = conv_op
         self.norm_op = norm_op
         self.norm_op_kwargs = norm_op_kwargs
         self.nonlin = nonlin
         self.nonlin_kwargs = nonlin_kwargs
+        # self.dropout_op = dropout_op
+        # self.dropout_op_kwargs = dropout_op_kwargs
         self.conv_bias = conv_bias
         self.kernel_sizes = kernel_sizes
 
@@ -908,9 +1077,11 @@ class UNetResEncoder(nn.Module):
             output = self.stem.compute_conv_feature_map_size(input_size)
         else:
             output = np.int64(0)
+
         for s in range(len(self.stages)):
             output += self.stages[s].compute_conv_feature_map_size(input_size)
             input_size = [i // j for i, j in zip(input_size, self.strides[s])]
+
         return output
 
 
@@ -928,10 +1099,13 @@ class UNetResDecoder(nn.Module):
         n_stages_encoder = len(encoder.output_channels)
         if isinstance(n_conv_per_stage, int):
             n_conv_per_stage = [n_conv_per_stage] * (n_stages_encoder - 1)
-        assert len(n_conv_per_stage) == n_stages_encoder - 1
+        assert len(n_conv_per_stage) == n_stages_encoder - 1, "n_conv_per_stage must have as many entries as we have " \
+                                                              "resolution stages - 1 (n_stages in encoder - 1), " \
+                                                              "here: %d" % n_stages_encoder
 
         stages = []
         upsample_layers = []
+
         seg_layers = []
         for s in range(1, n_stages_encoder):
             input_features_below = encoder.output_channels[-s]
@@ -944,6 +1118,7 @@ class UNetResDecoder(nn.Module):
                 pool_op_kernel_size=stride_for_upsampling,
                 mode='nearest'
             ))
+
             stages.append(nn.Sequential(
                 BasicResBlock(
                     conv_op=encoder.conv_op,
@@ -994,6 +1169,7 @@ class UNetResDecoder(nn.Module):
             lres_input = x
 
         seg_outputs = seg_outputs[::-1]
+
         if not self.deep_supervision:
             r = seg_outputs[0]
         else:
@@ -1005,7 +1181,9 @@ class UNetResDecoder(nn.Module):
         for s in range(len(self.encoder.strides) - 1):
             skip_sizes.append([i // j for i, j in zip(input_size, self.encoder.strides[s])])
             input_size = skip_sizes[-1]
+
         assert len(skip_sizes) == len(self.stages)
+
         output = np.int64(0)
         for s in range(len(self.stages)):
             output += self.stages[s].compute_conv_feature_map_size(skip_sizes[-(s + 1)])
@@ -1016,38 +1194,56 @@ class UNetResDecoder(nn.Module):
 
 
 class PAM_Module(Module):
-    """ Position attention module"""
     def __init__(self, in_dim):
         super(PAM_Module, self).__init__()
         self.chanel_in = in_dim
+
         self.query_conv = Conv2d(in_channels=in_dim, out_channels=in_dim // 8, kernel_size=1)
         self.key_conv = Conv2d(in_channels=in_dim, out_channels=in_dim // 8, kernel_size=1)
         self.value_conv = Conv2d(in_channels=in_dim, out_channels=in_dim, kernel_size=1)
         self.gamma = Parameter(torch.zeros(1))
+
         self.softmax = Softmax(dim=-1)
 
     def forward(self, x):
+        """
+            inputs :
+                x : input feature maps( B X C X H X W)
+            returns :
+                out : attention value + input feature
+                attention: B X (HxW) X (HxW)
+        """
         m_batchsize, C, height, width = x.size()
         proj_query = self.query_conv(x).view(m_batchsize, -1, width * height).permute(0, 2, 1)
         proj_key = self.key_conv(x).view(m_batchsize, -1, width * height)
         energy = torch.bmm(proj_query, proj_key)
         attention = self.softmax(energy)
         proj_value = self.value_conv(x).view(m_batchsize, -1, width * height)
+
         out = torch.bmm(proj_value, attention.permute(0, 2, 1))
         out = out.view(m_batchsize, C, height, width)
+
         out = self.gamma * out + x
         return out
 
 
 class CAM_Module(Module):
-    """ Channel attention module"""
+
     def __init__(self, in_dim):
         super(CAM_Module, self).__init__()
         self.chanel_in = in_dim
+
         self.gamma = Parameter(torch.zeros(1))
         self.softmax = Softmax(dim=-1)
 
     def forward(self, x):
+        """
+            inputs :
+                x : input feature maps( B X C X H X W)
+            returns :
+                out : attention value + input feature
+                attention: B X C X C
+        """
         m_batchsize, C, height, width = x.size()
         proj_query = x.view(m_batchsize, C, -1)
         proj_key = x.view(m_batchsize, C, -1).permute(0, 2, 1)
@@ -1055,8 +1251,10 @@ class CAM_Module(Module):
         energy_new = torch.max(energy, -1, keepdim=True)[0].expand_as(energy) - energy
         attention = self.softmax(energy_new)
         proj_value = x.view(m_batchsize, C, -1)
+
         out = torch.bmm(attention, proj_value)
         out = out.view(m_batchsize, C, height, width)
+
         out = self.gamma * out + x
         return out
 
@@ -1068,9 +1266,11 @@ class DANetHead(nn.Module):
         self.conv5a = nn.Sequential(nn.Conv2d(in_channels, inter_channels, 3, padding=1, bias=False),
                                     norm_layer(inter_channels),
                                     nn.ReLU())
+
         self.conv5c = nn.Sequential(nn.Conv2d(in_channels, inter_channels, 3, padding=1, bias=False),
                                     norm_layer(inter_channels),
                                     nn.ReLU())
+
         self.sa = PAM_Module(inter_channels)
         self.sc = CAM_Module(inter_channels)
         self.conv51 = nn.Sequential(nn.Conv2d(inter_channels, inter_channels, 3, padding=1, bias=False),
@@ -1079,8 +1279,10 @@ class DANetHead(nn.Module):
         self.conv52 = nn.Sequential(nn.Conv2d(inter_channels, inter_channels, 3, padding=1, bias=False),
                                     norm_layer(inter_channels),
                                     nn.ReLU())
+
         self.conv6 = nn.Sequential(nn.Dropout2d(0.1, False), nn.Conv2d(inter_channels, out_channels, 1))
         self.conv7 = nn.Sequential(nn.Dropout2d(0.1, False), nn.Conv2d(inter_channels, out_channels, 1))
+
         self.conv8 = nn.Sequential(nn.Dropout2d(0.1, False), nn.Conv2d(inter_channels, out_channels, 1))
 
     def forward(self, x):
@@ -1088,12 +1290,16 @@ class DANetHead(nn.Module):
         sa_feat = self.sa(feat1)
         sa_conv = self.conv51(sa_feat)
         sa_output = self.conv6(sa_conv)
+
         feat2 = self.conv5c(x)
         sc_feat = self.sc(feat2)
         sc_conv = self.conv52(sc_feat)
         sc_output = self.conv7(sc_conv)
+
         feat_sum = sa_conv + sc_conv
+
         sasc_output = self.conv8(feat_sum)
+
         output = [sasc_output]
         output.append(sa_output)
         output.append(sc_output)
@@ -1130,19 +1336,38 @@ class UMambaBot(nn.Module):
 
         for s in range(math.ceil(n_stages / 2), n_stages):
             n_blocks_per_stage[s] = 1
+
         for s in range(math.ceil((n_stages - 1) / 2 + 0.5), n_stages - 1):
             n_conv_per_stage_decoder[s] = 1
 
-        assert len(n_blocks_per_stage) == n_stages
-        assert len(n_conv_per_stage_decoder) == (n_stages - 1)
-
+        assert len(n_blocks_per_stage) == n_stages, "n_blocks_per_stage must have as many entries as we have " \
+                                                    f"resolution stages. here: {n_stages}. " \
+                                                    f"n_blocks_per_stage: {n_blocks_per_stage}"
+        assert len(n_conv_per_stage_decoder) == (n_stages - 1), "n_conv_per_stage_decoder must have one less entries " \
+                                                                f"as we have resolution stages. here: {n_stages} " \
+                                                                f"stages, so it should have {n_stages - 1} entries. " \
+                                                                f"n_conv_per_stage_decoder: {n_conv_per_stage_decoder}"
         self.encoder = UNetResEncoder(
-            input_channels, n_stages, features_per_stage, conv_op, kernel_sizes, strides,
-            n_blocks_per_stage, conv_bias, norm_op, norm_op_kwargs, nonlin, nonlin_kwargs,
-            return_skips=True, stem_channels=stem_channels
+            input_channels,
+            n_stages,
+            features_per_stage,
+            conv_op,
+            kernel_sizes,
+            strides,
+            n_blocks_per_stage,
+            conv_bias,
+            norm_op,
+            norm_op_kwargs,
+            nonlin,
+            nonlin_kwargs,
+            return_skips=True,
+            stem_channels=stem_channels
         )
+
         self.mamba_layer = MambaLayer(dim=features_per_stage[-1])
+
         self.decoder = UNetResDecoder(self.encoder, num_classes, n_conv_per_stage_decoder, deep_supervision)
+
         self.attention = DANetHead(256, 256, norm_layer=nn.BatchNorm2d)
         self.conv = nn.Conv2d(in_channels=512, out_channels=256, kernel_size=1, stride=1, padding=0)
         self.conv_sam = nn.ConvTranspose2d(in_channels=256, out_channels=256, kernel_size=2, stride=2)
@@ -1150,13 +1375,23 @@ class UMambaBot(nn.Module):
 
     def forward(self, x):
         skips = self.encoder(x)
+        # skips[-1] = self.mamba_layer(skips[-1])
+
         ori_out = self.mamba_layer(skips[-1])
         att_out = self.attention(skips[-1])[0]
         self.atten_out = att_out
+        # 将两个输出拼接在一起
         out = torch.cat((ori_out, att_out), 1)
         skips[-1] = self.conv(out)
+
         return self.decoder(skips)
 
     def compute_conv_feature_map_size(self, input_size):
-        assert len(input_size) == convert_conv_op_to_dim(self.encoder.conv_op)
-        return self.encoder.compute_conv_feature_map_size(input_size) + self.decoder.compute_conv_feature_map_size(input_size)
+        assert len(input_size) == convert_conv_op_to_dim(
+            self.encoder.conv_op), "just give the image size without color/feature channels or " \
+                                   "batch channel. Do not give input_size=(b, c, x, y(, z)). " \
+                                   "Give input_size=(x, y(, z))!"
+        return self.encoder.compute_conv_feature_map_size(input_size) + self.decoder.compute_conv_feature_map_size(
+            input_size)
+
+
